@@ -20,6 +20,10 @@ class _YoutubeWebAppState extends State<YoutubeWebApp> {
   InAppWebViewController? _web;
   var _booting = true;
   var _everLoaded = false;
+  var _immersive = false;
+  var _fsActive = false;
+  var _landscapeLocked = false;
+  var _orientationEpoch = 0;
   late final List<ContentBlocker> _blockers;
   late final List<UserScript> _scripts;
   late final PullToRefreshController _pullToRefresh;
@@ -50,8 +54,13 @@ $_hideSelector { display: none !important; }
 .html5-video-player.ad-showing {
   background: #000 !important;
 }
-.ytp-settings-button, .ytp-settings-menu, .ytp-popup, .ytp-panel,
-.ytp-overflow-panel, .ytp-fullscreen-button {
+.ytp-settings-button, .ytp-fullscreen-button {
+  pointer-events: auto !important;
+  visibility: visible !important;
+}
+/* Menus re-homed into the fullscreen element must paint above the video. */
+.gareeb-fs-menu {
+  z-index: 2147483647 !important;
   pointer-events: auto !important;
   visibility: visible !important;
 }
@@ -243,6 +252,114 @@ $_hideSelector { display: none !important; }
 })();
 ''';
 
+  /// Android WebView hard-disables `screen.orientation.lock()` (it has no
+  /// Activity to rotate), so YouTube's own "go landscape" path throws and it
+  /// falls back to the Fullscreen API. Hand the lock to Flutter instead.
+  static const _orientationJs = r'''
+(function() {
+  if (window.__gareebOrient) return;
+  window.__gareebOrient = true;
+
+  var so = window.screen && window.screen.orientation;
+  if (!so) return;
+
+  function tell(mode) {
+    try {
+      var bridge = window.flutter_inappwebview;
+      if (bridge && bridge.callHandler) {
+        return Promise.resolve(bridge.callHandler('gareebOrientation', mode));
+      }
+    } catch (e) {}
+    return Promise.resolve(false);
+  }
+
+  function define(name, fn) {
+    try {
+      Object.defineProperty(so, name, {
+        configurable: true,
+        writable: true,
+        value: fn
+      });
+    } catch (e) {}
+  }
+
+  // lock() resolves with undefined; unlock() is synchronous and returns void.
+  define('lock', function(mode) {
+    return tell(String(mode || 'any')).then(function() {});
+  });
+  define('unlock', function() {
+    tell('any');
+  });
+})();
+''';
+
+  /// If YouTube still takes the Fullscreen API route, any menu it opens lives
+  /// outside the fullscreen element, so it paints *under* the top layer and
+  /// looks like a dead button. Move those menus inside while fullscreen.
+  static const _fullscreenJs = r'''
+(function() {
+  if (window.__gareebFs) return;
+  window.__gareebFs = true;
+
+  var MENUS = [
+    'ytm-sheet-view', 'ytm-bottom-sheet-renderer', 'ytm-modal-overlay',
+    'ytm-player-settings', '.player-settings-menu', '.ytm-sheet',
+    'tp-yt-paper-dialog', 'tp-yt-iron-dropdown', 'c3-dialog',
+    '.ytp-popup', '.ytp-settings-menu'
+  ].join(', ');
+
+  function fsEl() {
+    return document.fullscreenElement || document.webkitFullscreenElement || null;
+  }
+
+  function laidOut(el) {
+    // Outside the top layer an open menu still has layout, just no paint.
+    return el.offsetHeight > 0 || el.offsetWidth > 0 || !!el.offsetParent;
+  }
+
+  function adopt() {
+    var root = fsEl();
+    if (!root || root === document.documentElement || root === document.body) return;
+    document.querySelectorAll(MENUS).forEach(function(el) {
+      if (el === root || root.contains(el) || el.contains(root)) return;
+      if (!laidOut(el)) return;
+      if (!el.__gareebHome) el.__gareebHome = el.parentNode;
+      try {
+        root.appendChild(el);
+        el.classList.add('gareeb-fs-menu');
+      } catch (e) {}
+    });
+  }
+
+  function restore() {
+    document.querySelectorAll('.gareeb-fs-menu').forEach(function(el) {
+      el.classList.remove('gareeb-fs-menu');
+      var home = el.__gareebHome;
+      el.__gareebHome = null;
+      if (home) {
+        try { home.appendChild(el); } catch (e) {}
+      }
+    });
+  }
+
+  function sync() {
+    var on = !!fsEl();
+    if (on) adopt(); else restore();
+    try {
+      var bridge = window.flutter_inappwebview;
+      if (bridge && bridge.callHandler) {
+        bridge.callHandler('gareebFullscreen', on);
+      }
+    } catch (e) {}
+  }
+
+  document.addEventListener('fullscreenchange', sync, true);
+  document.addEventListener('webkitfullscreenchange', sync, true);
+  // Menus are created lazily, well after the fullscreenchange event.
+  setInterval(function() { if (fsEl()) adopt(); }, 400);
+})();
+''';
+
   @override
   void initState() {
     super.initState();
@@ -274,6 +391,16 @@ $_hideSelector { display: none !important; }
         source: _polishJs,
         injectionTime: UserScriptInjectionTime.AT_DOCUMENT_END,
         forMainFrameOnly: false,
+      ),
+      UserScript(
+        source: _orientationJs,
+        injectionTime: UserScriptInjectionTime.AT_DOCUMENT_START,
+        forMainFrameOnly: true,
+      ),
+      UserScript(
+        source: _fullscreenJs,
+        injectionTime: UserScriptInjectionTime.AT_DOCUMENT_END,
+        forMainFrameOnly: true,
       ),
     ];
     unawaited(_bootFilters());
@@ -336,11 +463,122 @@ $_hideSelector { display: none !important; }
     await _web?.evaluateJavascript(source: _adPruneJs);
     await _web?.injectCSSCode(source: _adHideCss);
     await _web?.evaluateJavascript(source: _polishJs);
+    await _web?.evaluateJavascript(source: _orientationJs);
+    await _web?.evaluateJavascript(source: _fullscreenJs);
+  }
+
+  static const _freeOrientations = [
+    DeviceOrientation.portraitUp,
+    DeviceOrientation.portraitDown,
+    DeviceOrientation.landscapeLeft,
+    DeviceOrientation.landscapeRight,
+  ];
+
+  void _registerHandlers(InAppWebViewController controller) {
+    controller.addJavaScriptHandler(
+      handlerName: 'gareebOrientation',
+      callback: (args) {
+        unawaited(_requestOrientation(args.isEmpty ? 'any' : '${args.first}'));
+        return true;
+      },
+    );
+    controller.addJavaScriptHandler(
+      handlerName: 'gareebFullscreen',
+      callback: (args) {
+        unawaited(_setFullscreen(args.isNotEmpty && args.first == true));
+        return true;
+      },
+    );
+  }
+
+  Future<void> _lockLandscape() async {
+    _orientationEpoch++;
+    await SystemChrome.setPreferredOrientations(const [
+      DeviceOrientation.landscapeLeft,
+      DeviceOrientation.landscapeRight,
+    ]);
+  }
+
+  /// Snap back to portrait, then hand control to the sensor again. Without the
+  /// brief portrait lock the phone stays landscape until it is physically
+  /// turned, which is not what leaving fullscreen should feel like.
+  Future<void> _releaseOrientation() async {
+    final epoch = ++_orientationEpoch;
+    await SystemChrome.setPreferredOrientations(const [
+      DeviceOrientation.portraitUp,
+    ]);
+    await Future<void>.delayed(const Duration(milliseconds: 400));
+    if (epoch != _orientationEpoch) return;
+    await SystemChrome.setPreferredOrientations(_freeOrientations);
+  }
+
+  /// Immersive while either signal is live, so the CSS-fullscreen path (only
+  /// an orientation lock) and the Fullscreen API path both get a clean screen.
+  Future<void> _syncSystemChrome() async {
+    final wanted = _fsActive || _landscapeLocked;
+    if (wanted == _immersive) return;
+    _immersive = wanted;
+    await SystemChrome.setEnabledSystemUIMode(
+      wanted ? SystemUiMode.immersiveSticky : SystemUiMode.edgeToEdge,
+    );
+    if (mounted) setState(() {});
+  }
+
+  /// Serves the shimmed `screen.orientation.lock()` / `.unlock()`.
+  Future<void> _requestOrientation(String mode) async {
+    final value = mode.toLowerCase();
+    if (value.startsWith('landscape')) {
+      _landscapeLocked = true;
+      await _lockLandscape();
+    } else if (value.startsWith('portrait')) {
+      _landscapeLocked = false;
+      _orientationEpoch++;
+      await SystemChrome.setPreferredOrientations(const [
+        DeviceOrientation.portraitUp,
+      ]);
+    } else {
+      _landscapeLocked = false;
+      await _releaseOrientation();
+    }
+    await _syncSystemChrome();
+  }
+
+  Future<void> _setFullscreen(bool active) async {
+    if (_fsActive == active) return;
+    _fsActive = active;
+    if (active) {
+      await _lockLandscape();
+    } else if (!_landscapeLocked) {
+      await _releaseOrientation();
+    }
+    await _syncSystemChrome();
+  }
+
+  @override
+  void dispose() {
+    _orientationEpoch++;
+    unawaited(SystemChrome.setPreferredOrientations(_freeOrientations));
+    unawaited(SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge));
+    super.dispose();
   }
 
   Future<bool> _handleBack() async {
     final web = _web;
-    if (web != null && await web.canGoBack()) {
+    if (web == null) return true;
+    // Back out of fullscreen first, otherwise we navigate away still locked
+    // to landscape.
+    if (_fsActive || _landscapeLocked) {
+      await web.evaluateJavascript(
+        source: 'try { if (document.fullscreenElement) document.exitFullscreen(); } '
+            'catch (e) {}',
+      );
+      await _setFullscreen(false);
+      if (_landscapeLocked) {
+        await _requestOrientation('any');
+      }
+      return false;
+    }
+    if (await web.canGoBack()) {
       await web.goBack();
       return false;
     }
@@ -360,6 +598,11 @@ $_hideSelector { display: none !important; }
       child: Scaffold(
         backgroundColor: _ink,
         body: SafeArea(
+          // Fullscreen video should reach the notch and the nav-bar strip.
+          top: !_immersive,
+          bottom: !_immersive,
+          left: !_immersive,
+          right: !_immersive,
           child: Stack(
             children: [
               InAppWebView(
@@ -417,19 +660,12 @@ $_hideSelector { display: none !important; }
                   }
                   return false;
                 },
-                onWebViewCreated: (controller) => _web = controller,
-                onEnterFullscreen: (_) {
-                  unawaited(
-                    SystemChrome.setEnabledSystemUIMode(
-                      SystemUiMode.immersiveSticky,
-                    ),
-                  );
+                onWebViewCreated: (controller) {
+                  _web = controller;
+                  _registerHandlers(controller);
                 },
-                onExitFullscreen: (_) {
-                  unawaited(
-                    SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge),
-                  );
-                },
+                onEnterFullscreen: (_) => unawaited(_setFullscreen(true)),
+                onExitFullscreen: (_) => unawaited(_setFullscreen(false)),
                 onLoadStart: (controller, url) {
                   if (!_everLoaded && mounted) {
                     setState(() => _booting = true);
