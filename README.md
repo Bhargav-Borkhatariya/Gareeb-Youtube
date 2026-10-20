@@ -32,6 +32,26 @@ adb install -r build/app/outputs/flutter-apk/app-release.apk
 
 Debug signing is enough. No store listing.
 
+## iOS Build
+
+Building for iOS requires Apple's toolchain (Xcode / macOS). Since local Linux environments cannot compile native iOS apps directly, two paths are supported:
+
+### Option 1: GitHub Actions (Automated Cloud Build - Free & Recommended)
+A workflow has been configured in `.github/workflows/build-ios.yml`.
+1. Push your changes to GitHub.
+2. Go to the repository's **Actions** tab on GitHub.
+3. Select **Build iOS IPA** and click **Run workflow** (or simply push to `main`).
+4. Download the compiled `GareebYouTube.ipa` from the workflow summary artifacts.
+5. Sideload onto iPhone/iPad using [Sideloadly](https://sideloadly.io/), [AltStore](https://altstore.io/), or TrollStore.
+
+### Option 2: Build Locally on macOS
+If you have access to a Mac:
+```bash
+flutter pub get
+flutter build ios --release --no-codesign
+```
+Or open `ios/Runner.xcworkspace` in Xcode to run on a physical iPhone or Simulator with your free personal Apple ID signing.
+
 ## When playback breaks (it will)
 
 Nothing unofficial works forever. YouTube changes servers. ReVanced stopping after about a minute is that war.
