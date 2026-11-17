@@ -32,7 +32,7 @@ class AdFilters {
     'api/stats/ads',
     'api/stats/atr',
     'get_midroll',
-    'player/ad',
+    '/player/ads',
     '/adview',
     'pcs/activeview',
     'pcs/view',
@@ -70,6 +70,25 @@ class AdFilters {
     'adBreaks',
   };
 
+  /// YouTube serves its player from `/s/player/<build-id>/…`, and the build id
+  /// is hex, so ids like `ad8d59ae` read as an ad path to any substring rule.
+  /// Nothing under these paths is ever an ad; keep them out of the matcher.
+  static const _firstPartyAssetPaths = {
+    '/s/player/',
+    '/s/desktop/',
+    '/s/mobile/',
+    '/s/tv/',
+    '/s/search/',
+    '/yts/',
+    '.vflset/',
+  };
+
+  static const _firstPartyAssetHosts = {
+    'youtube.com',
+    'youtube-nocookie.com',
+    'ytimg.com',
+  };
+
   static const _neverBlockHosts = {
     'youtube.com',
     'youtu.be',
@@ -103,6 +122,7 @@ class AdFilters {
 
   bool matches(String url) {
     final value = url.toLowerCase();
+    if (_isFirstPartyAsset(value)) return false;
     if (_isCoreYoutubeUrl(value)) {
       return builtinNeedles.any(value.contains);
     }
@@ -112,6 +132,11 @@ class AdFilters {
         (value.contains('oad=') ||
             value.contains('&oad') ||
             value.contains('ctier=l'));
+  }
+
+  static bool _isFirstPartyAsset(String value) {
+    if (!_firstPartyAssetHosts.any(value.contains)) return false;
+    return _firstPartyAssetPaths.any(value.contains);
   }
 
   static bool _isCoreYoutubeUrl(String value) {
@@ -256,7 +281,8 @@ $hide { display: none !important; }
       if (_isProtectedHost(host)) {
         if (path == '/api/stats' || path == '/api/stats/') continue;
         if (_isCoreYoutubeUrl('youtube.com$path')) continue;
-        if (path.length > 2) needles.add(path);
+        // Stubs like `/ad` match half the site once they are substrings.
+        if (path.length > 4) needles.add(path);
         continue;
       }
       if (host.contains('.')) hosts.add(host);

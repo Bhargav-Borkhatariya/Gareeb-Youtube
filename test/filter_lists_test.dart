@@ -30,6 +30,30 @@ m.youtube.com##+js(json-prune, playerResponse.adPlacements playerAds adSlots)
     expect(filters.jsonKeys, containsAll(['adPlacements', 'playerAds', 'adSlots']));
   });
 
+  test('never blocks YouTube\'s own player assets', () {
+    final filters = AdFilters.builtin();
+    // The player build id is hex, so it can start with "ad".
+    expect(
+      filters.matches(
+        'https://m.youtube.com/s/player/ad8d59ae/player-plasma-es6-en_GB.vflset/base.js',
+      ),
+      isFalse,
+    );
+    expect(
+      filters.matches('https://m.youtube.com/s/player/ad8d59ae/mweb.css'),
+      isFalse,
+    );
+    // A fetched rule must not be able to turn a stub path into a needle that
+    // swallows the player either.
+    final loose = AdFilters.builtin().merge(AdFilters.parse('||youtube.com/ad\n'));
+    expect(
+      loose.matches(
+        'https://m.youtube.com/s/player/ad8d59ae/player-plasma-es6-en_GB.vflset/base.js',
+      ),
+      isFalse,
+    );
+  });
+
   test('builtin engine still blocks known ad hosts', () {
     final filters = AdFilters.builtin();
     expect(filters.matches('https://googleads.g.doubleclick.net/pagead/id'), isTrue);
